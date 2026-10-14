@@ -2,6 +2,7 @@
 //
 // Created on: <29-Oct-2004 12:04:28 vs>
 //
+// Copyright (C) 1998 - 2026 7x & Exponential Foundation. All rights reserved.
 // Copyright (C) 1999-2013 eZ Systems as. All rights reserved.
 //
 // This source file is part of the eZ Publish (tm) Open Source Content
@@ -37,10 +38,15 @@
 
 class eZOracleSchema extends eZDBSchemaInterface
 {
+    /// the columns of the tables, for fetchTableFields() (a WHERE follows)
+    const COLUMNS_QUERY = "SELECT   a.table_name AS table_name, a.column_name AS col_name, decode (a.nullable, 'N', '1', 'Y', '0') AS not_null, a.data_type AS col_type, a.data_length AS col_size, a.char_length AS col_char_size, a.char_used AS col_char_used, a.data_default AS default_val, a.data_precision AS col_precision, a.data_scale AS col_scale FROM user_tab_columns a";
 
-    function eZOracleSchema( $params )
+    /// the indexes of the tables, for fetchTableIndexes() (an AND may follow)
+    const INDEXES_QUERY = "SELECT ui.table_name AS table_name, ui.index_name AS name, ui.index_type AS type, decode( ui.uniqueness, 'NONUNIQUE', 0, 'UNIQUE', 1 ) AS is_unique, uic.column_name AS col_name, uic.column_position AS col_pos FROM user_indexes ui, user_ind_columns uic WHERE ui.index_name = uic.index_name AND ui.index_type NOT LIKE 'FUNCTION-BASED%'";
+
+    public function __construct( $params )
     {
-        $this->eZDBSchemaInterface( $params );
+        parent::__construct( $params );
     }
 
     function schema( $params = array() )
@@ -63,6 +69,7 @@ class eZOracleSchema extends eZDBSchemaInterface
             if ( !is_array( $tableArray ) )
                 $tableArray = array();
 
+            $tableNames = array();
             foreach( $tableArray as $tableNameArray )
             {
                 $table_name    = current( $tableNameArray );
@@ -71,12 +78,24 @@ class eZOracleSchema extends eZDBSchemaInterface
                     ( is_array( $params['table_include'] ) and
                     ( in_array( $table_name_lc, $params['table_include'] ) or in_array( $table_name, $params['table_include'] ) ) ) )
                 {
-                    $schema_table['name']    = $table_name_lc;
-                    $schema_table['fields']  = $this->fetchTableFields( $table_name, array_merge( $params, array( 'autoIncrementColumns' => $autoIncrementColumns ) ) );
-                    $schema_table['indexes'] = $this->fetchTableIndexes( $table_name, $params );
-
-                    $schema[$table_name_lc] = $schema_table;
+                    $tableNames[] = $table_name;
                 }
+            }
+
+            // Columns and indexes of all the tables in one query each: one query per
+            // table and kind, every one of them hard parsed, took minutes for the
+            // few hundred tables of an installation
+            $dictionaryParams = count( $tableNames ) > 2 ? array( 'dictionary' => $this->fetchDictionary() ) : array();
+
+            foreach ( $tableNames as $table_name )
+            {
+                $table_name_lc = strtolower( $table_name );
+                $schema_table = array();
+                $schema_table['name']    = $table_name_lc;
+                $schema_table['fields']  = $this->fetchTableFields( $table_name, array_merge( $params, $dictionaryParams, array( 'autoIncrementColumns' => $autoIncrementColumns ) ) );
+                $schema_table['indexes'] = $this->fetchTableIndexes( $table_name, array_merge( $params, $dictionaryParams ) );
+
+                $schema[$table_name_lc] = $schema_table;
             }
             $this->transformSchema( $schema, $params['format'] == 'local' );
             ksort( $schema );
@@ -89,6 +108,29 @@ class eZOracleSchema extends eZDBSchemaInterface
         }
 
         return $schema;
+    }
+
+    /**
+     * Reads the columns and index columns of all the tables of the schema, with
+     * one query each, grouped by upper-case table name, for fetchTableFields() and
+     * fetchTableIndexes() (their 'dictionary' parameter).
+     *
+     * @return array array( 'columns' => array( TABLE => rows ), 'indexes' => array( TABLE => rows ) )
+     */
+    function fetchDictionary()
+    {
+        $dictionary = array( 'columns' => array(), 'indexes' => array() );
+        $rows = $this->DBInstance->arrayQuery( eZOracleSchema::COLUMNS_QUERY . " JOIN user_tables t ON t.table_name = a.table_name ORDER BY a.table_name, a.column_id" );
+        foreach ( is_array( $rows ) ? $rows : array() as $row )
+        {
+            $dictionary['columns'][$row['table_name']][] = $row;
+        }
+        $rows = $this->DBInstance->arrayQuery( eZOracleSchema::INDEXES_QUERY );
+        foreach ( is_array( $rows ) ? $rows : array() as $row )
+        {
+            $dictionary['indexes'][$row['table_name']][] = $row;
+        }
+        return $dictionary;
     }
 
     /**
@@ -105,22 +147,26 @@ class eZOracleSchema extends eZDBSchemaInterface
         $oraStringTypes  = array( 'CHAR', 'VARCHAR2' );                        // FIXME: const
         $fields      = array();
 
-        $query = "SELECT   a.column_name AS col_name, " .
-                 "         decode (a.nullable, 'N', '1', 'Y', '0') AS not_null, " .
-                 "         a.data_type AS col_type, " .
-                 "         a.data_length AS col_size, " .
-                 "         a.data_default AS default_val, " .
-                 "         a.data_precision AS col_precision, " .
-                 "         a.data_scale AS col_scale " .
-                 "FROM     user_tab_columns a ".
-                 "WHERE    upper(a.table_name) = '$table' " .
-                 "ORDER BY a.column_id";
-
-        $resultArray = $this->DBInstance->arrayQuery( $query );
-        foreach( $resultArray as $row )
+        if ( is_array( $params ) && isset( $params['dictionary']['columns'] ) )
+        {
+            // read for all tables at once by schema()
+            $table = strtoupper( $table );
+            $resultArray = isset( $params['dictionary']['columns'][$table] ) ? $params['dictionary']['columns'][$table] : array();
+        }
+        else
+        {
+            // names are stored in upper case: no upper() on the column, so its index can be used
+            $query = eZOracleSchema::COLUMNS_QUERY . " WHERE a.table_name = '" . $this->DBInstance->escapeString( strtoupper( $table ) ) . "' ORDER BY a.column_id";
+            $resultArray = $this->DBInstance->arrayQuery( $query );
+        }
+        foreach( is_array( $resultArray ) ? $resultArray : array() as $row )
         {
             $colName     = strtolower( $row['col_name'] );
-            $colLength   = $row['col_size'];
+            // data_length is in bytes; a VARCHAR2(255 CHAR) column (the driver sets
+            // NLS_LENGTH_SEMANTICS=CHAR) is 255 characters, but 1020 bytes in AL32UTF8
+            $colLength   = ( isset( $row['col_char_used'] ) && $row['col_char_used'] === 'C' && (int)$row['col_char_size'] > 0 )
+                         ? $row['col_char_size']
+                         : $row['col_size'];
             $colType     = $row['col_type'];
             $colNotNull  = $row['not_null'];
             $colDefault  = $row['default_val'];
@@ -132,6 +178,13 @@ class eZOracleSchema extends eZDBSchemaInterface
             {
                 // strip trailing spaces
                 $colDefault = rtrim( $colDefault );
+                // no default: the driver can return NULL of the LONG data_default
+                // column as '' (OracleEmptyStringForNull), and a default of '' does
+                // not exist in Oracle anyway ('' is NULL)
+                if ( $colDefault === '' )
+                {
+                    $colDefault = null;
+                }
             }
 
             if ( $isAutoIncCol )
@@ -202,7 +255,7 @@ class eZOracleSchema extends eZDBSchemaInterface
             $fields[$colName] =& $field;
             unset( $field );
         }
-        if ( $params['sort_columns'] )
+        if ( is_array( $params ) && !empty( $params['sort_columns'] ) )
         {
             ksort( $fields );
         }
@@ -216,16 +269,19 @@ class eZOracleSchema extends eZDBSchemaInterface
     function fetchTableIndexes( $table, $params=array() )
     {
         $indexes = array();
-        $query = "SELECT ui.index_name AS name, " .
-                 "       ui.index_type AS type, " .
-                 "       decode( ui.uniqueness, 'NONUNIQUE', 0, 'UNIQUE', 1 ) AS is_unique, " .
-                 "       uic.column_name AS col_name, " .
-                 "       uic.column_position AS col_pos " .
-                 "FROM user_indexes ui, user_ind_columns uic " .
-                 "WHERE ui.index_name = uic.index_name AND ui.table_name = '$table'";
-        $resultArray = $this->DBInstance->arrayQuery( $query );
+        if ( is_array( $params ) && isset( $params['dictionary']['indexes'] ) )
+        {
+            // read for all tables at once by schema()
+            $table = strtoupper( $table );
+            $resultArray = isset( $params['dictionary']['indexes'][$table] ) ? $params['dictionary']['indexes'][$table] : array();
+        }
+        else
+        {
+            $query = eZOracleSchema::INDEXES_QUERY . " AND ui.table_name = '" . $this->DBInstance->escapeString( strtoupper( $table ) ) . "'";
+            $resultArray = $this->DBInstance->arrayQuery( $query );
+        }
 
-        foreach( $resultArray as $row )
+        foreach( is_array( $resultArray ) ? $resultArray : array() as $row )
         {
             $idxName = strtolower( $row['name'] );
             if ( strpos( $idxName, 'sys_' ) === 0 )
@@ -246,7 +302,7 @@ class eZOracleSchema extends eZDBSchemaInterface
         {
             ksort( $index['fields'] );
         }
-        if ( $params['sort_indexes'] )
+        if ( is_array( $params ) && !empty( $params['sort_indexes'] ) )
         {
             ksort( $indexes );
         }
@@ -260,12 +316,13 @@ class eZOracleSchema extends eZDBSchemaInterface
     function detectAutoIncrements( $params )
     {
         $autoIncColumns = array();
-        $query = "SELECT table_name, trigger_name, trigger_body, status FROM user_triggers WHERE table_name LIKE 'EZ%'";
+        // all tables: extension tables (explayouts_*, cjwnl_* ...) have sequences too
+        $query = "SELECT table_name, trigger_name, trigger_body, status FROM user_triggers WHERE table_name NOT LIKE 'BIN$%'";
         $resultArray = $this->DBInstance->arrayQuery( $query );
-        foreach ( $resultArray as $row )
+        foreach ( is_array( $resultArray ) ? $resultArray : array() as $row )
         {
             $triggerBody =& $row['trigger_body'];
-            if ( !preg_match( '/SELECT\s+(\w+).nextval\s+INTO\s+:new.(\w+)\s+FROM\s+dual/', $triggerBody, $matches ) )
+            if ( !is_string( $triggerBody ) || !preg_match( '/SELECT\s+(\w+)\.nextval\s+INTO\s+:new\."?(\w+)"?\s+FROM\s+dual/i', $triggerBody, $matches ) )
                 continue;
 
             $seqName =& $matches[1];
@@ -277,7 +334,7 @@ class eZOracleSchema extends eZDBSchemaInterface
                 // the column is thus technically an autoincrement, but it can never work...
                 $query = "SELECT COUNT(*) AS ok FROM user_sequences WHERE sequence_name = '" . strtoupper( $seqName ) . "'";
                 $resultArray2 = $this->DBInstance->arrayQuery( $query );
-                if ( $resultArray2[0]['ok'] != 1 )
+                if ( !isset( $resultArray2[0]['ok'] ) || $resultArray2[0]['ok'] != 1 )
                 {
                     continue;
                 }
@@ -312,7 +369,15 @@ class eZOracleSchema extends eZDBSchemaInterface
                 return 'longtext';
             case 'CHAR':
                 return 'char';
+            case 'BLOB':
+                return 'longblob';
+            case 'DATE':
+                return 'date';
             default:
+                if ( strpos( $type, 'TIMESTAMP' ) === 0 )
+                {
+                    return 'datetime';
+                }
                 return $type;
         }
         return 'unknown';
@@ -376,11 +441,11 @@ class eZOracleSchema extends eZDBSchemaInterface
         {
             if ( is_array( $fieldDef ) )
             {
-                $fieldNames[] = $fieldDef['name'];
+                $fieldNames[] = self::quoteIdentifier( $fieldDef['name'] );
             }
             else
             {
-                $fieldNames[] = $fieldDef;
+                $fieldNames[] = self::quoteIdentifier( $fieldDef );
             }
         }
         $sql .= '( ' . join ( ', ', $fieldNames ) . ' )';
@@ -410,15 +475,28 @@ class eZOracleSchema extends eZDBSchemaInterface
      */
     function getOracleType( $mysqlType )
     {
-        $rslt = $mysqlType;
-        $rslt = preg_replace( '/varchar/', 'VARCHAR2', $rslt );
-        $rslt = preg_replace( '/char/', 'CHAR', $rslt );
-        $rslt = preg_replace( '/(big)?int(eger)?(\([0-9]+\))?( +unsigned)?/', 'INTEGER', $rslt );
-        $rslt = preg_replace( '/^(medium|long)?text$/', 'CLOB', $rslt );
-        $rslt = preg_replace( '/^double$/', 'BINARY_DOUBLE', $rslt );
-        $rslt = preg_replace( '/^float$/', 'FLOAT', $rslt );
-        $rslt = preg_replace( '/decimal/', 'NUMBER', $rslt );
-        return $rslt;
+        // every pattern matches the whole type name: 'tinyint' must not become 'tinyINTEGER'
+        $typeMap = array( '/^varchar$/i'                                        => 'VARCHAR2',
+                          '/^char$/i'                                           => 'CHAR',
+                          '/^(tiny|small|medium|big)?int(eger)?(\([0-9]+\))?( +unsigned)?$/i' => 'INTEGER',
+                          '/^bool(ean)?$/i'                                     => 'INTEGER',
+                          '/^(tiny|medium|long)?text$/i'                        => 'CLOB',
+                          '/^(tiny|medium|long)?blob$/i'                        => 'BLOB',
+                          '/^double( precision)?$/i'                            => 'BINARY_DOUBLE',
+                          '/^float$/i'                                          => 'FLOAT',
+                          '/^(decimal|numeric)$/i'                              => 'NUMBER',
+                          '/^(datetime|timestamp)$/i'                           => 'TIMESTAMP',
+                          '/^date$/i'                                           => 'DATE' );
+        $type = trim( (string)$mysqlType );
+        foreach ( $typeMap as $pattern => $oracleType )
+        {
+            if ( preg_match( $pattern, $type ) )
+            {
+                return $oracleType;
+            }
+        }
+        // auto_increment is handled by the caller; anything else goes through as it is
+        return $type;
     }
 
     /**
@@ -428,7 +506,7 @@ class eZOracleSchema extends eZDBSchemaInterface
     {
         $oraNumericTypes = array( 'INTEGER', 'FLOAT', 'DOUBLE PRECISION', 'NUMBER', 'BINARY_DOUBLE' ); // const
 
-        $sql_def = $field_name . ' ';
+        $sql_def = self::quoteIdentifier( $field_name ) . ' ';
 
         $oraType = eZOracleSchema::getOracleType( $def['type'] );
         $isNumericField = in_array( $oraType, $oraNumericTypes );
@@ -440,7 +518,9 @@ class eZOracleSchema extends eZDBSchemaInterface
             // note: mysql DECIMAL(X,Y) we convert to NUMBER(X,Y) while keeping default val unquoted
             // NB: the following code is not entirely correct, as it prevents us to generate INTEGER(x),
             //     but it has always been like this in ezoracle, so we do not change (yet)
-            if ( isset( $def['length'] ) && ( !$isNumericField || $oraType == 'NUMBER' ) )
+            // LOBs and date types take no length (MySQL's 'datetime(6)' style is not carried over)
+            $typesWithoutLength = array( 'CLOB', 'BLOB', 'DATE', 'TIMESTAMP' );
+            if ( isset( $def['length'] ) && ( !$isNumericField || $oraType == 'NUMBER' ) && !in_array( $oraType, $typesWithoutLength ) )
                 $sql_def .= "({$def['length']})";
 
             // default
@@ -535,9 +615,9 @@ class eZOracleSchema extends eZDBSchemaInterface
             // in short: we need to rebuild all table indexes after switching type
             if ( in_array( 'type', $params['different-options'] ) )
             {
-                $sql .= "ALTER TABLE $table_name MODIFY (". $field_name . " NULL);\n" .
-                        "ALTER TABLE $table_name MODIFY (". $field_name . " LONG);\n" .
-                        "ALTER TABLE $table_name MODIFY (" . $field_name . " CLOB);\n" .
+                $sql .= "ALTER TABLE $table_name MODIFY (". self::quoteIdentifier( $field_name ) . " NULL);\n" .
+                        "ALTER TABLE $table_name MODIFY (". self::quoteIdentifier( $field_name ) . " LONG);\n" .
+                        "ALTER TABLE $table_name MODIFY (" . self::quoteIdentifier( $field_name ) . " CLOB);\n" .
                         "DECLARE\n" .
                         "  CURSOR idx_cur IS SELECT index_name FROM user_indexes WHERE table_name='" . strtoupper( $table_name ) . "' AND index_type <> 'LOB';\n" .
                         "BEGIN\n" .
@@ -563,14 +643,14 @@ class eZOracleSchema extends eZDBSchemaInterface
         if ( $def['type'] == 'auto_increment' && in_array( 'type', $params['different-options'] ) )
         {
             $defs = $this->generateAutoIncrement( $table_name, $field_name, $def );
-            $seq_name = str_replace ( array( 'CREATE SEQUENCE ', ";\n" ), '', $defs['sequences'][0] );
+            $seq_name = eZOracleSchema::sequenceName( $table_name );
             $sql = "\n" .
                 "DECLARE\n" .
                 "  maxval INTEGER;\n" .
                 "  obj_exists EXCEPTION;\n" .
                 "  PRAGMA EXCEPTION_INIT(obj_exists, -955);\n" .
                 "BEGIN\n" .
-                "  SELECT NVL(MAX($field_name), 0) INTO maxval FROM $table_name;\n" .
+                "  SELECT NVL(MAX(" . self::quoteIdentifier( $field_name ) . "), 0) INTO maxval FROM $table_name;\n" .
                 "  maxval := maxval + 1;\n" . // takes care of 0 elements table too
                 "  EXECUTE IMMEDIATE 'CREATE SEQUENCE $seq_name MINVALUE ' || maxval;\n" .
                 "EXCEPTION WHEN obj_exists THEN\n" .
@@ -599,12 +679,85 @@ class eZOracleSchema extends eZDBSchemaInterface
      * Cuts given identifier to the specified length providing uniqueness of all
      * shortened identifiers.
      */
-    function shorten( $identifier, $length = 30 )
+    static function shorten( $identifier, $length = 30 )
     {
-        static $cnt = 1;
         if( strlen( $identifier ) <= $length )
             return $identifier;
-        return substr( $identifier, 0, $length-5 ) . sprintf( "%05d", $cnt++ );
+        // the suffix is derived from the full name, so the same schema always
+        // gets the same names (a counter made them depend on the order of calls)
+        return substr( $identifier, 0, $length - 6 ) . '_' . substr( md5( $identifier ), 0, 5 );
+    }
+
+    /**
+     * Works out the Oracle name of every index of $schema (generic names, 'local'
+     * structure otherwise), as [table][generic index name] => local name.
+     *
+     * MySQL index names are unique per table, Oracle ones per schema, and they
+     * share the namespace of tables, sequences and views: the .dba files of the
+     * kernel and the extensions reuse names across tables (cjw_newsletter has
+     * 'contentobject_attribute_id' on several), which failed with ORA-00955.
+     * A name that is used by another table of $schema, or by an object of the
+     * connected database that is not an index of the same table, becomes
+     * <table>_<name>. Names longer than 30 bytes are shortened (the limit of
+     * Oracle before 12.2). Primary keys are unnamed and not listed.
+     *
+     * @param array $schema
+     * @return array
+     */
+    function schemaUniqueIndexNames( $schema )
+    {
+        // names already in the database: name => table of the index, or '' for other objects
+        $existing = array();
+        if ( is_object( $this->DBInstance ) && method_exists( $this->DBInstance, 'isConnected' ) && $this->DBInstance->isConnected() )
+        {
+            $rows = $this->DBInstance->arrayQuery( "SELECT o.object_name AS name, i.table_name AS table_name " .
+                                                   "FROM user_objects o LEFT JOIN user_indexes i ON i.index_name = o.object_name " .
+                                                   "WHERE o.object_type IN ( 'TABLE', 'INDEX', 'SEQUENCE', 'VIEW', 'SYNONYM' ) AND o.object_name NOT LIKE 'BIN$%'" );
+            foreach ( is_array( $rows ) ? $rows : array() as $row )
+            {
+                $existing[strtolower( $row['name'] )] = strtolower( (string)$row['table_name'] );
+            }
+        }
+
+        // how many tables of this schema use each name
+        $useCount = array();
+        foreach ( $schema as $tableName => $table )
+        {
+            if ( $tableName == '_info' || !isset( $table['indexes'] ) || !is_array( $table['indexes'] ) )
+                continue;
+            foreach ( $table['indexes'] as $idxName => $idx )
+            {
+                if ( isset( $idx['type'] ) && $idx['type'] == 'primary' )
+                    continue;
+                $useCount[$idxName] = isset( $useCount[$idxName] ) ? $useCount[$idxName] + 1 : 1;
+            }
+        }
+
+        $names = array();
+        foreach ( $schema as $tableName => $table )
+        {
+            if ( $tableName == '_info' || !isset( $table['indexes'] ) || !is_array( $table['indexes'] ) )
+                continue;
+            foreach ( $table['indexes'] as $idxName => $idx )
+            {
+                if ( isset( $idx['type'] ) && $idx['type'] == 'primary' )
+                    continue;
+                $localName = $idxName;
+                $clash = ( $useCount[$idxName] > 1 ) ||
+                         ( isset( $existing[$idxName] ) && $existing[$idxName] !== $tableName ) ||
+                         ( $idxName !== $tableName && isset( $schema[$idxName] ) );
+                if ( $clash && strpos( $idxName, $tableName . '_' ) !== 0 )
+                {
+                    $localName = $tableName . '_' . $idxName;
+                }
+                if ( strlen( $localName ) > 30 )
+                {
+                    $localName = eZOracleSchema::shorten( $localName, 28 ) . '_i';
+                }
+                $names[$tableName][$idxName] = $localName;
+            }
+        }
+        return $names;
     }
 
     /**
@@ -617,22 +770,28 @@ class eZOracleSchema extends eZDBSchemaInterface
      */
     function generateAutoIncrement( $table_name, $field_name, $field_def, $params=array(), $withClosure = true )
     {
-        $seqName  = preg_replace( '/^ez/', 's_', $table_name );
-        if ( $seqName == $table_name )
-        {
-            // table name does not start with 'ez': an extension, most likely
-            $seqName = substr( 'se_' . $seqName, 0, 30 );
-        }
+        $seqName  = eZOracleSchema::sequenceName( $table_name );
         $trigName = eZOracleSchema::shorten( $table_name . '_' . $field_name, 30-3 ) .'_tr';
-        $sqlSeq = "CREATE SEQUENCE $seqName";
+        // A table dropped with a plain DROP TABLE (package installers, upgrade
+        // scripts) leaves its sequence behind, and a plain CREATE SEQUENCE then
+        // fails with ORA-00955, so the table could never be created again.
+        // An existing sequence is kept: correctSequenceValues() moves it past
+        // the ids of the inserted data. Plain PL/SQL, so it runs on 19c as well
+        // as on 23ai (which would also know CREATE SEQUENCE IF NOT EXISTS).
+        $sqlSeq = "BEGIN\n" .
+                  "  EXECUTE IMMEDIATE 'CREATE SEQUENCE $seqName';\n" .
+                  "EXCEPTION WHEN OTHERS THEN\n" .
+                  "  IF SQLCODE != -955 THEN RAISE; END IF;\n" .
+                  "END;";
         if ( $withClosure )
-            $sqlSeq .= ";\n";
+            $sqlSeq .= "\n/\n";
         // be kind to people that unwittingly save this file with CR-LF line endings
         // (PLSQL does not like that at all, so the trigger would not compile any more)
+        $quotedField = self::quoteIdentifier( $field_name );
         $sqlTrig = "CREATE OR REPLACE TRIGGER $trigName
-BEFORE INSERT ON $table_name FOR EACH ROW WHEN (new.$field_name IS NULL)
+BEFORE INSERT ON $table_name FOR EACH ROW WHEN (new.{$quotedField} IS NULL)
 BEGIN\n".
-"  SELECT $seqName.nextval INTO :new.$field_name FROM dual;\n".
+"  SELECT $seqName.nextval INTO :new.{$quotedField} FROM dual;\n".
 "END;";
        if ( $withClosure )
             $sqlTrig .= "\n/\n";
@@ -720,9 +879,37 @@ BEGIN\n".
     /**
      * @access private
      */
-    function generateDropTable( $table )
+    function generateDropTable( $table, $params = array() )
     {
-        return "DROP TABLE $table;\n";
+        // the auto_increment sequence is not dropped with the table (the trigger is);
+        // a table without one simply has no sequence to drop
+        $seqName = eZOracleSchema::sequenceName( $table );
+        return "DROP TABLE $table;\n" .
+               "BEGIN\n" .
+               "  EXECUTE IMMEDIATE 'DROP SEQUENCE $seqName';\n" .
+               "EXCEPTION WHEN OTHERS THEN\n" .
+               "  IF SQLCODE != -2289 THEN RAISE; END IF;\n" .
+               "END;\n/\n";
+    }
+
+    /**
+     * The name of the sequence that feeds the auto_increment column of $tableName:
+     * 'ez' is replaced by 's_' (ezcontentobject -> s_contentobject), other tables
+     * get 'se_' in front, cut to 30 characters. eZOracleDB::lastSerialID() reads
+     * the same sequence.
+     *
+     * @param string $tableName
+     * @return string
+     */
+    static function sequenceName( $tableName )
+    {
+        $seqName = preg_replace( '/^ez/', 's_', $tableName );
+        if ( $seqName == $tableName )
+        {
+            // table name does not start with 'ez': an extension, most likely
+            $seqName = substr( 'se_' . $seqName, 0, 30 );
+        }
+        return $seqName;
     }
 
     /**
@@ -745,8 +932,8 @@ BEGIN\n".
         $multiInsert = ( isset( $params['allow_multi_insert'] ) and $params['allow_multi_insert'] ) ? $this->isMultiInsertSupported() : false;
 
         // Make sure we don't generate SQL when there are no rows
-        if ( count( $dataEntries['rows'] ) == 0 )
-            return '';
+        if ( !isset( $dataEntries['rows'] ) || count( $dataEntries['rows'] ) == 0 )
+            return array();
 
         $sqlList = array();
         $sql = '';
@@ -769,7 +956,7 @@ BEGIN\n".
             {
                 $defText .= ",$dfnl ";
             }
-            $defText .= $fieldName;
+            $defText .= self::quoteIdentifier( $fieldName );
             ++$entryIndex;
         }
 
@@ -781,7 +968,8 @@ BEGIN\n".
             {
                 foreach( $blobs as $blobcol )
                 {
-                    if ( strlen( $row[$blobcol] ) > 4000 )
+                    // a SQL literal holds at most 4000 bytes
+                    if ( strlen( (string)$row[$blobcol] ) > 4000 )
                     {
                         $splitrows[] = $i;
                     }
@@ -826,7 +1014,7 @@ BEGIN\n".
                 }
                 if ( in_array( $i, $splitrows ) && in_array( $j, $blobs ) )
                 {
-                    $dataText .= 'empty_clob()';
+                    $dataText .= $row[$j] === null ? 'NULL' : 'empty_clob()';
                 }
                 else
                 {
@@ -860,19 +1048,28 @@ BEGIN\n".
                     $insert .= "INSERT INTO $tableName ($dfnl$defText$dfnl) VALUES ($dfnl$dataText$dfnl) RETURNING ";
                     foreach ( $blobs as $blobname => $blobcol )
                     {
-                        $insert .= "$blobname INTO v_$blobcol, ";
+                        $insert .= self::quoteIdentifier( $blobname ) . " INTO v_$blobcol, ";
                     }
                     $insert = substr( $insert, 0, -2 ) . ";\n";
                     foreach ( $blobs as $blobcol )
                     {
-                        while( ( $len = strlen( $row[$blobcol] ) > 4000 ) )
+                        // NULL stays NULL (no locator to append to)
+                        if ( $row[$blobcol] === null )
+                            continue;
+                        // Oracle counts a CLOB in characters, not bytes: the value is
+                        // cut at character boundaries into literals of at most
+                        // CLOB_CHUNK_BYTES bytes, and DBMS_LOB.APPEND() takes no
+                        // amount, so no length has to be worked out here (an amount in
+                        // bytes failed with ORA-22921 on every multibyte text, and a
+                        // character past the BMP counts twice in a CLOB)
+                        foreach ( self::splitClobText( $row[$blobcol] ) as $chunk )
                         {
-                            $insert .= "dbms_lob.writeappend(v_$blobcol, 4000, '" . $this->escapeSQLString( substr( $row[$blobcol], 0, 4000 ) ). "');\n";
-                            $row[$blobcol] = substr( $row[$blobcol], 4000 );
+                            $insert .= "dbms_lob.append(v_$blobcol, TO_CLOB('" . $this->escapeSQLString( $chunk ) . "'));\n";
                         }
-                        $insert .= "dbms_lob.writeappend(v_$blobcol, " . strlen( $row[$blobcol] ) . ", '" . $this->escapeSQLString( $row[$blobcol] ) . "');\n";
                     }
-                    $insert .= "COMMIT;\nEND;"; // plsql does not parse with final ';' anyway
+                    // no COMMIT here: the caller owns the transaction (insertSchema()
+                    // loads all the data in one), so a failing row keeps nothing behind
+                    $insert .= "END;"; // plsql does not parse with final ';' anyway
                     $sqlList[] = $insert;
                 }
                 else
@@ -905,10 +1102,17 @@ BEGIN\n".
         if ( !eZDBSchemaInterface::transformSchema( $schema, $toLocal ) )
             return false;
 
+        // Oracle index names are unique per schema, MySQL ones per table
+        $localIndexNames = $toLocal ? $this->schemaUniqueIndexNames( $schema ) : array();
+
         foreach ( $schema as $tableName => $tableSchema )
         {
             if ( $tableName == '_info' )
                 continue;
+            if ( !isset( $tableSchema['indexes'] ) || !is_array( $tableSchema['indexes'] ) )
+                $tableSchema['indexes'] = array();
+            if ( !isset( $tableSchema['fields'] ) || !is_array( $tableSchema['fields'] ) )
+                $tableSchema['fields'] = array();
 
             if ( !$toLocal )
             {
@@ -917,11 +1121,22 @@ BEGIN\n".
                 foreach ( $tableSchema['indexes'] as $idxName => $idxSchema )
                 {
                     if ( strpos( $idxName, 'sys_' ) === 0 )
+                    {
                         $tmpNewIndexes['PRIMARY'] =& $tableSchema['indexes'][$idxName];
+                        eZDebugSetting::writeDebug( 'lib-dbschema-transformation', '',
+                                                    "renamed index $tableName.$idxName => PRIMARY" );
+                        $idxName = 'PRIMARY';
+                    }
+                    else if ( isset( $idxSchema['_original']['name'] ) )
+                    {
+                        // an index renamed to be unique in the Oracle schema gets its generic name back
+                        $genericIdxName = $idxSchema['_original']['name'];
+                        $tmpNewIndexes[$genericIdxName] =& $tableSchema['indexes'][$idxName];
+                        unset( $tmpNewIndexes[$genericIdxName]['_original']['name'] );
+                        $idxName = $genericIdxName;
+                    }
                     else
                         $tmpNewIndexes[$idxName] =& $tableSchema['indexes'][$idxName];
-                    eZDebugSetting::writeDebug( 'lib-dbschema-transformation', '',
-                                                "renamed index $tableName.$idxName => PRIMARY" );
 
                     // restore the mysql-specific stuff, if it is found
                     if ( isset( $tmpNewIndexes[$idxName]['_original'] ) && isset( $tmpNewIndexes[$idxName]['_original']['fields'] ) )
@@ -960,11 +1175,15 @@ BEGIN\n".
                         {
                             $schema[$tableName]['fields'][$fieldName]['length'] = $tableSchema['_original']['fields'][$fieldName]['length'];
                         }
+                        if ( isset( $tableSchema['_original']['fields'][$fieldName]['not_null'] ) )
+                        {
+                            $schema[$tableName]['fields'][$fieldName]['not_null'] = $tableSchema['_original']['fields'][$fieldName]['not_null'];
+                        }
                     }
 
                     // always fix default values for CLOB fields: they should be false instead of null
                     // NB: this is a weird convention in eZP standard dba files that we should fix...
-                    if ( $fieldSchema['type'] == 'longtext' && $fieldSchema['default'] === null )
+                    if ( $fieldSchema['type'] == 'longtext' && array_key_exists( 'default', $fieldSchema ) && $fieldSchema['default'] === null )
                     {
                         $schema[$tableName]['fields'][$fieldName]['default'] = false;
                         eZDebugSetting::writeDebug( 'lib-dbschema-transformation', '',
@@ -978,15 +1197,20 @@ BEGIN\n".
                 $tmpNewIndexes = array();
                 foreach ( $tableSchema['indexes'] as $idxName => $idxSchema )
                 {
-                    if ( strlen( $idxName ) > 30 )
+                    $newIdxName = isset( $localIndexNames[$tableName][$idxName] ) ? $localIndexNames[$tableName][$idxName] : $idxName;
+                    if ( $newIdxName !== $idxName )
                     {
-                        $newIdxName = eZOracleSchema::shorten( $idxName, 28 ) . '_i';
                         $tmpNewIndexes[$newIdxName] =& $tableSchema['indexes'][$idxName];
+                        $tmpNewIndexes[$newIdxName]['_original']['name'] = $idxName;
                         eZDebugSetting::writeDebug( 'lib-dbschema-transformation', '',
-                                                    "shortened index name $tableName.$idxName to $newIdxName" );
+                                                    "renamed index $tableName.$idxName to $newIdxName" );
                     }
                     else
                         $tmpNewIndexes[$idxName] =& $tableSchema['indexes'][$idxName];
+                    // the rest of the loop works on the entry under its new name
+                    $idxName = $newIdxName;
+                    if ( !isset( $tmpNewIndexes[$idxName]['fields'] ) || !is_array( $tmpNewIndexes[$idxName]['fields'] ) )
+                        continue;
 
                     // remove the mysql-specific stuff, store it for later if we want to go back
                     foreach ( $tmpNewIndexes[$idxName]['fields'] as $field => $desc )
@@ -1017,18 +1241,35 @@ BEGIN\n".
 
                 foreach ( $tableSchema['fields'] as $fieldName => $fieldSchema )
                 {
-                    if ( ( $fieldSchema['type'] == 'longtext' && $fieldSchema['default'] === false ) ||
-                         ( ( $fieldSchema['type'] == 'varchar' || $fieldSchema['type'] == 'char' ) && ( $fieldSchema['default'] === '' || $fieldSchema['default'] === false ) ) )
+                    $fieldDefault = array_key_exists( 'default', $fieldSchema ) ? $fieldSchema['default'] : null;
+                    if ( ( $fieldSchema['type'] == 'longtext' && $fieldDefault === false ) ||
+                         ( ( $fieldSchema['type'] == 'varchar' || $fieldSchema['type'] == 'char' ) && ( $fieldDefault === '' || $fieldDefault === false ) ) )
                     {
-                        $schema[$tableName]['_original']['fields'][$fieldName]['default'] = $schema[$tableName]['fields'][$fieldName]['default'];
+                        $schema[$tableName]['_original']['fields'][$fieldName]['default'] = $fieldDefault;
                         $schema[$tableName]['fields'][$fieldName]['default'] = null;
                         eZDebugSetting::writeDebug( 'lib-dbschema-transformation', '',
                                                     "changed default value for $tableName.$fieldName from null to false" );
 
                     }
 
+                    // Oracle stores '' as NULL, so a NOT NULL text column refuses the
+                    // empty string that MySQL, PostgreSQL and SQLite store (ORA-01400),
+                    // whether its default is '' or it has none: eZPersistentObject and
+                    // the installers write '' into such columns all the time. Every text
+                    // column is therefore nullable on Oracle; the reverse transformation
+                    // restores the original option. (This covers the columns
+                    // ColumnOptionTranslations lists one by one, and all the others.)
+                    if ( in_array( $fieldSchema['type'], array( 'varchar', 'char', 'longtext', 'mediumtext', 'text', 'tinytext' ) ) &&
+                         !empty( $schema[$tableName]['fields'][$fieldName]['not_null'] ) )
+                    {
+                        $schema[$tableName]['_original']['fields'][$fieldName]['not_null'] = $schema[$tableName]['fields'][$fieldName]['not_null'];
+                        unset( $schema[$tableName]['fields'][$fieldName]['not_null'] );
+                        eZDebugSetting::writeDebug( 'lib-dbschema-transformation', '',
+                                                    "made text column $tableName.$fieldName nullable ('' is NULL in Oracle)" );
+                    }
+
                     // fix bigints: oracle looses info about them not being integers
-                    if ( $fieldSchema['type'] == 'bigint' && $fieldSchema['length'] == 20 )
+                    if ( $fieldSchema['type'] == 'bigint' && isset( $fieldSchema['length'] ) && $fieldSchema['length'] == 20 )
                     {
                         $schema[$tableName]['_original']['fields'][$fieldName]['type'] = 'bigint';
                         $schema[$tableName]['_original']['fields'][$fieldName]['length'] = 20;
@@ -1042,6 +1283,70 @@ BEGIN\n".
         }
 
         return true;
+    }
+
+    /**
+     * The largest piece, in bytes, of a CLOB value in one string literal of the
+     * PL/SQL that generateTableInsertSQLList() writes: a SQL literal may not be
+     * longer than 4000 bytes, and TO_CLOB() takes a SQL value.
+     */
+    const CLOB_CHUNK_BYTES = 4000;
+
+    /**
+     * Cuts $text into pieces of at most $maxBytes bytes, never inside a UTF-8
+     * character (a character cut in two was stored as a broken one, or failed).
+     * Text that is not valid UTF-8 is cut at $maxBytes bytes, as before.
+     *
+     * @param string $text
+     * @param int $maxBytes
+     * @return string[]
+     */
+    static function splitClobText( $text, $maxBytes = self::CLOB_CHUNK_BYTES )
+    {
+        $text = (string)$text;
+        $chunks = array();
+        $utf8 = preg_match( '//u', $text ) === 1;
+        while ( strlen( $text ) > $maxBytes )
+        {
+            $cut = $maxBytes;
+            // step back over UTF-8 continuation bytes (10xxxxxx) to a character start
+            while ( $utf8 && $cut > 0 && ( ord( $text[$cut] ) & 0xC0 ) === 0x80 )
+            {
+                --$cut;
+            }
+            if ( $cut === 0 )
+            {
+                $cut = $maxBytes;
+            }
+            $chunks[] = substr( $text, 0, $cut );
+            $text = (string)substr( $text, $cut );
+        }
+        if ( $text !== '' )
+        {
+            $chunks[] = $text;
+        }
+        return $chunks;
+    }
+
+    /**
+     * $name as Oracle has to see it: an Oracle reserved word (reservedKeywordList(),
+     * e.g. COMMENT or MODE, which extensions use as column names) is quoted, in upper
+     * case, so it is the same column that an unquoted name would have been and the
+     * data dictionary, the driver (eZOracleDB, which quotes these names in the
+     * statements it runs) and a read-back of the schema all agree on it. Any other
+     * name is returned as it is.
+     *
+     * @param string $name
+     * @return string
+     */
+    static function quoteIdentifier( $name )
+    {
+        static $reserved = null;
+        if ( $reserved === null )
+        {
+            $reserved = array_flip( self::reservedKeywordList() );
+        }
+        return isset( $reserved[strtolower( $name )] ) ? '"' . strtoupper( $name ) . '"' : $name;
     }
 
     function escapeSQLString( $value )
@@ -1066,7 +1371,8 @@ BEGIN\n".
     */
     static function reservedKeywordList()
     {
-        return array(
+        // the entries of the list carried trailing spaces, so none could match a name
+        return array_map( 'trim', array(
             'access ',
             'else ',
             'modify ',
@@ -1180,7 +1486,7 @@ BEGIN\n".
             'mode ',
             'rows ',
             'with'
-        );
+        ) );
     }
 
 }

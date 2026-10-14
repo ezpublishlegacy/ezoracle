@@ -1,0 +1,23 @@
+{
+    "name": "se7enxweb/ezoracle",
+    "description": "Oracle database driver for Exponential CMS (PHP 8, oci8)",
+    "type": "ezpublish-legacy-extension",
+    "license": "GPL-2.0-or-later",
+    "authors": [
+        {
+            "name": "7x",
+            "email": "info@se7enx.com"
+        },
+        {
+            "name": "eZ Publish dev-team & eZ Community",
+            "homepage": "https://github.com/se7enxweb/ezoracle"
+        }
+    ],
+    "minimum-stability": "dev",
+    "require": {
+        "se7enxweb/exponential-legacy-installer": "*"
+    },
+    "extra": {
+        "ezpublish-legacy-extension-name": "ezoracle"
+    }
+}
